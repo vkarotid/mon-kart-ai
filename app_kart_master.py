@@ -2,11 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from fpdf import FPDF
-import sqlite3
-from datetime import datetime
 from io import StringIO
+import sqlite3
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Karting AI Pro", layout="wide", page_icon="🏁")
@@ -30,8 +27,9 @@ with st.sidebar:
     category = st.selectbox("Type de Moteur", ["Mini 60", "Rotax 125 Junior (J125)", "Rotax Max (Senior)"], key="motor_select")
     
     st.divider()
-    st.subheader("🌤️ Conditions Météo")
+    st.subheader("🌤️ Conditions & Setup")
     t_air = st.slider("Température Air (°C)", -5, 45, 20)
+    pression_pneus = st.number_input("Pression à froid (Bar)", value=0.50, step=0.01)
     g_actuel = st.number_input("Gicleur actuel", value=122)
     
     if "Rotax" in category:
@@ -39,7 +37,7 @@ with st.sidebar:
         st.warning(f"🔧 Gicleur suggéré : **{g_suggere}**")
     
     st.divider()
-    st.info("💡 **Export AiM :** Utilisez le format CSV avec 'Comma' comme séparateur.")
+    st.info("💡 **Export AiM :** Utilisez le format CSV. Assurez-vous d'inclure 'GPS Speed', 'RPM', 'Temp' et 'GPS Accel'.")
 
 # --- INTERFACE PRINCIPALE ---
 st.title("🏎️ Karting AI Telemetry Analyzer")
@@ -49,133 +47,152 @@ file_user = st.file_uploader("📂 Téléverser le fichier CSV de la Session", t
 if file_user:
     try:
         # 1. Lecture brute et détection intelligente du header
-        raw_content = file_user.read().decode('utf-8').splitlines()
+        content = file_user.read().decode('utf-8', errors='ignore').splitlines()
         header_index = 0
-        for i, line in enumerate(raw_content):
-            if any(k in line for k in ["Distance", "Speed", "RPM", "GPS", "Lap"]):
+        sep = ","
+        for i, line in enumerate(content):
+            if any(k in line for k in ["Distance", "Speed", "RPM", "GPS", "Vitesse"]):
                 header_index = i
+                if line.count(';') > line.count(','): sep = ";"
                 break
         
-        # 2. Chargement avec Pandas (Gestion des lignes malformées)
-        data_str = "\n".join(raw_content[header_index:])
-        df = pd.read_csv(StringIO(data_str), sep=None, engine='python', on_bad_lines='skip')
-        
-        # Nettoyage des noms de colonnes (espaces et guillemets)
+        # 2. Chargement avec Pandas
+        data_str = "\n".join(content[header_index:])
+        df = pd.read_csv(StringIO(data_str), sep=sep, engine='python', on_bad_lines='skip')
         df.columns = [c.strip().replace('"', '') for c in df.columns]
 
         # 3. Mappeur de colonnes (Standardisation)
         mapping = {
-            'Vitesse': ['GPS_Speed', 'Speed', 'GPS Speed', 'VehicleSpeed', 'Vitesse'],
-            'RPM': ['RPM', 'EngineSpeed', 'Eng_RPM', 'Moteur_RPM', 'RPM_Moteur'],
-            'Eau': ['Water_Temp', 'WaterTemp', 'ECT', 'Temp_Eau', 'Temp_H2O', 'Water'],
-            'EGT': ['EGT', 'Exhaust_Temp', 'Temp_Echap', 'EGT_1'],
+            'Vitesse': ['GPS_Speed', 'Speed', 'GPS Speed', 'Vitesse'],
+            'RPM': ['RPM', 'EngineSpeed', 'Eng_RPM', 'Moteur_RPM'],
+            'Eau': ['Water_Temp', 'WaterTemp', 'Temp_Eau', 'Eau'],
             'LatG': ['GPS_LatAcc', 'LatAcc', 'G_Lat', 'Acc_Lat'],
             'LonG': ['GPS_LonAcc', 'LonAcc', 'G_Lon', 'Acc_Lon'],
             'Distance': ['Distance', 'Dist', 'GPS_Distance'],
-            'Lap': ['Lap', 'LapNumber', 'Tour', 'Lap_Number', 'Lap_No']
+            'Lap': ['Lap', 'LapNumber', 'Tour', 'Lap_No'],
+            'Time': ['Time', 'Time_sec', 'Temps']
         }
 
-        found_map = {}
         for target, aliases in mapping.items():
             for alias in aliases:
                 if alias in df.columns:
                     df = df.rename(columns={alias: target})
-                    found_map[target] = True
                     break
 
-        # Vérification des données minimales
-        if 'Vitesse' not in df.columns or 'RPM' not in df.columns:
-            st.error(f"❌ Colonnes critiques manquantes. Trouvées : {list(df.columns)}")
-            st.stop()
-
-        # 4. Nettoyage numérique
-        cols_to_convert = ['Vitesse', 'RPM', 'Eau', 'EGT', 'Distance', 'Lap', 'LatG', 'LonG']
+        # Nettoyage numérique
+        cols_to_convert = ['Vitesse', 'RPM', 'Eau', 'Distance', 'Lap', 'LatG', 'LonG', 'Time']
         for col in cols_to_convert:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        
         df = df.dropna(subset=['Vitesse', 'RPM'])
 
-        # --- ANALYSE GLOBALE ET PAR TOUR ---
+        # Détection auto des tours si manquants
+        if 'Lap' not in df.columns or df['Lap'].nunique() <= 1:
+            if 'Distance' in df.columns:
+                df['Lap'] = (df['Distance'].diff() < -100).cumsum() + 1
+            else:
+                df['Lap'] = 1
+
+        # --- ANALYSE DES TOURS ---
+        laps = sorted(df['Lap'].dropna().unique().astype(int))
+        summary_data = []
+        for l in laps:
+            lap_df = df[df['Lap'] == l]
+            if len(lap_df) > 10:
+                # Calcul du temps au tour (si colonne Time présente)
+                lap_time = "N/A"
+                if 'Time' in lap_df.columns:
+                    lap_time_val = lap_df['Time'].max() - lap_df['Time'].min()
+                    lap_time = f"{int(lap_time_val//60)}:{lap_time_val%60:06.3f}"
+                
+                summary_data.append({
+                    "Tour": l,
+                    "Temps": lap_time,
+                    "Vmax": lap_df['Vitesse'].max(),
+                    "RPM Max": lap_df['RPM'].max(),
+                    "RPM Min": lap_df['RPM'].min(),
+                    "Eau Max": lap_df['Eau'].max() if 'Eau' in df.columns else 0,
+                    "G-Lat Max": lap_df['LatG'].abs().max() if 'LatG' in df.columns else 0
+                })
+
+        summary_df = pd.DataFrame(summary_data)
+        
+        # Identification du meilleur tour
+        best_lap_idx = summary_df['Vmax'].idxmax() # Par défaut sur Vmax si Time absent
+        best_lap_num = summary_df.loc[best_lap_idx, 'Tour']
+
         st.header(f"📊 Analyse de Session : {category}")
+        st.subheader(f"🏆 Meilleur Tour Détecté : Tour {best_lap_num}")
         
-        # Section récapitulative tour par tour
-        if 'Lap' in df.columns and df['Lap'].nunique() > 1:
-            laps = sorted(df['Lap'].dropna().unique().astype(int))
-            
-            with st.expander("📝 Tableau Récapitulatif de la Session", expanded=True):
-                summary_data = []
-                for l in laps:
-                    lap_df = df[df['Lap'] == l]
-                    if not lap_df.empty:
-                        summary_data.append({
-                            "Tour": l,
-                            "Vmax (km/h)": round(lap_df['Vitesse'].max(), 1),
-                            "RPM Max": int(lap_df['RPM'].max()),
-                            "Eau Max": round(lap_df['Eau'].max(), 1) if 'Eau' in df.columns else "N/A"
-                        })
-                st.table(pd.DataFrame(summary_data))
-            
-            sel_lap = st.select_slider("Choisir un tour pour l'analyse détaillée", options=laps, key="main_lap_slider")
-            df_view = df[df['Lap'] == sel_lap]
-        else:
-            df_view = df
-            st.info("💡 Note : Données continues. Pour une analyse tour par tour, exportez la colonne 'Lap' depuis RaceStudio.")
+        with st.expander("📝 Détails de tous les tours", expanded=False):
+            st.table(summary_df)
 
-        # --- AFFICHAGE DES GRAPHIQUES ---
-        st.divider()
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Vmax (Session)", f"{df['Vitesse'].max():.1f} km/h")
-        col_m2.metric("RPM Max (Session)", f"{df['RPM'].max():.0f}")
-        if 'Eau' in df.columns:
-            col_m3.metric("Temp. Eau Max", f"{df['Eau'].max():.1f} °C")
+        # --- FOCUS SUR LE TOUR SÉLECTIONNÉ ---
+        sel_lap = st.select_slider("Sélectionner un tour pour l'analyse d'expert", options=laps, value=int(best_lap_num))
+        df_view = df[df['Lap'] == sel_lap]
+        
+        # Statistiques spécifiques du tour
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Vmax", f"{df_view['Vitesse'].max():.1f} km/h")
+        s2.metric("RPM Max", f"{int(df_view['RPM'].max())}")
+        s3.metric("RPM Min", f"{int(df_view['RPM'].min())}")
+        s4.metric("Eau Max", f"{df_view['Eau'].max():.1f} °C" if 'Eau' in df.columns else "N/A")
+        s5.metric("G-Lat Max", f"{df_view['LatG'].abs().max():.2f} G" if 'LatG' in df.columns else "N/A")
 
-        # Graphique principal
+        # Graphique
         fig = go.Figure()
-        x_axis = df_view['Distance'] if 'Distance' in df_view.columns else df_view.index
-        
-        fig.add_trace(go.Scatter(x=x_axis, y=df_view['Vitesse'], name="Vitesse (km/h)", line=dict(color='cyan', width=2)))
-        fig.add_trace(go.Scatter(x=x_axis, y=df_view['RPM'], name="RPM", yaxis="y2", line=dict(color='orange', dash='dot')))
-        
-        fig.update_layout(
-            title=f"Télémétrie Détail",
-            xaxis=dict(title="Distance (m)"),
-            yaxis=dict(title="Vitesse (km/h)", gridcolor='gray'),
-            yaxis2=dict(title="RPM", overlaying='y', side='right'),
-            hovermode="x unified",
-            template="plotly_dark"
-        )
+        x_ax = df_view['Distance'] if 'Distance' in df_view.columns else df_view.index
+        fig.add_trace(go.Scatter(x=x_ax, y=df_view['Vitesse'], name="Vitesse", line=dict(color='cyan')))
+        fig.add_trace(go.Scatter(x=x_ax, y=df_view['RPM'], name="RPM", yaxis="y2", line=dict(color='orange', dash='dot')))
+        fig.update_layout(template="plotly_dark", yaxis2=dict(overlaying='y', side='right'), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- VERDICT IA ---
-        st.subheader("🤖 Verdict de l'Ingénieur")
-        conseils = []
-        
-        # Logique spécifique Rotax J125
-        if category == "Rotax 125 Junior (J125)":
-            max_rpm_val = df_view['RPM'].max()
-            if max_rpm_val > 13800:
-                conseils.append("❌ **Rapport trop COURT :** Le moteur sature trop tôt en ligne droite. Enlève 1 ou 2 dents à la couronne.")
-            elif max_rpm_val < 13200:
-                conseils.append("⚠️ **Rapport trop LONG :** Tu n'atteins pas le régime de puissance max. Ajoute des dents.")
-        
-        # Logique Température
-        if 'Eau' in df.columns:
-            temp_max = df['Eau'].max()
-            if temp_max > 60:
-                conseils.append("🔥 **ALERTE CHAUFFE :** Ton moteur a dépassé 60°C. Vérifie le radiateur ou le débit d'eau.")
-            elif temp_max < 45:
-                conseils.append("🔵 **MOTEUR FROID :** Température sous 45°C. Masque ton radiateur pour gagner en performance.")
+        # --- SECTION RÉGLAGES EXPERTS ---
+        st.divider()
+        col_moteur, col_chassis = st.columns(2)
 
-        if not conseils:
-            st.success("✅ Les paramètres moteur semblent optimaux sur ce roulage.")
-        else:
-            for c in conseils:
-                st.write(c)
+        with col_moteur:
+            st.subheader("⚙️ Optimisation Moteur")
+            if category == "Rotax 125 Junior (J125)":
+                if df_view['RPM'].max() > 13900: st.error("Rapport trop court : Enlevez 1 dent.")
+                elif df_view['RPM'].max() < 13400: st.warning("Rapport trop long : Ajoutez 1-2 dents.")
+            
+            if 'Eau' in df_view.columns:
+                if df_view['Eau'].max() > 55: st.error("Chauffe excessive : Ouvrez le rideau de radiateur.")
+                elif df_view['Eau'].max() < 45: st.info("Moteur trop froid : Cachez le radiateur (Cible 50°C).")
+
+        with col_chassis:
+            st.subheader("🛠️ Guide de Réglages Châssis")
+            lat_g = df_view['LatG'].abs().max() if 'LatG' in df_view.columns else 1.5
+            
+            # Système expert de conseils
+            if lat_g < 1.8:
+                st.write("**Problème détecté : Manque de Grip Latéral**")
+                tabs = st.tabs(["Train Avant", "Train Arrière", "Hauteur/Barre"])
+                
+                with tabs[0]:
+                    st.write("- **Chasse :** Augmenter (plus de grip en entrée).")
+                    st.write("- **Carrossage (Camber) :** Mettre plus de négatif.")
+                    st.write("- **Largeur :** Élargir le train avant (+1 bague de chaque côté).")
+                    st.write("- **Bagues :** Enlever des bagues pour assouplir la fusée.")
+                
+                with tabs[1]:
+                    st.write("- **Axe Arrière :** Passer sur un axe plus souple (type S ou MS).")
+                    st.write("- **Largeur :** Rétrécir le train arrière (Cible 139cm max).")
+                    st.write("- **Pression :** Augmenter de +50g si les pneus ne montent pas en température.")
+                
+                with tabs[2]:
+                    st.write("- **Hauteur :** Baisser l'arrière et monter l'avant.")
+                    st.write("- **Barre Avant :** Mettre la barre **Ronde** ou la barre **Plate en position verticale** pour plus de rigidité.")
+
+            else:
+                st.write("**Problème détecté : Trop de Grip / Kart qui saute**")
+                st.write("- **Axe :** Passer sur un axe plus dur (type H ou HH).")
+                st.write("- **Train Arrière :** Élargir au maximum (140cm).")
+                st.write("- **Barre Avant :** Enlever la barre ou mettre la barre plate à l'horizontale.")
+                st.write("- **Pression :** Baisser la pression de 0.05 bar.")
 
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'analyse : {e}")
-        st.info("Vérifiez le format de votre fichier CSV exporté.")
-
+        st.error(f"❌ Erreur : {e}")
 else:
-    st.info("👋 En attente d'un fichier CSV... Exportez vos données depuis AiM RaceStudio pour commencer.")
+    st.info("👋 Chargez un fichier CSV pour obtenir l'analyse d'expert.")
