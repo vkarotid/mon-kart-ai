@@ -75,70 +75,147 @@ with st.expander("📖 GUIDE D'UTILISATION (Cliquez pour ouvrir)", expanded=Fals
 
 file_user = st.file_uploader("📂 Téléverser le fichier CSV de RaceStudio", type=["csv"])
 
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from fpdf import FPDF
+import sqlite3
+from datetime import datetime
+from io import StringIO
+
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Karting AI Pro", layout="wide", page_icon="🏁")
+
+# --- DATABASE ---
+def init_db():
+    conn = sqlite3.connect('karting_history.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  date TEXT, circuit TEXT, categorie TEXT, chrono TEXT,
+                  gicleur INTEGER, couronne INTEGER, vmax REAL, rpm_max REAL, verdict TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- INTERFACE ---
+with st.sidebar:
+    st.title("🏁 Configuration")
+    category = st.selectbox("Moteur", ["Mini 60", "Rotax 125 Junior (J125)", "Rotax Max (Senior)"])
+    st.divider()
+    st.subheader("🌤️ Météo")
+    t_air = st.slider("Température Air (°C)", -5, 45, 20)
+    g_actuel = st.number_input("Gicleur actuel", value=122)
+
+st.title("🏎️ Karting AI Telemetry Analyzer")
+
+file_user = st.file_uploader("📂 Téléverser le fichier CSV (Session Complète)", type=["csv"])
+
 if file_user:
     try:
-        # 1. Lecture du fichier
-        content = file_user.read().decode('utf-8').splitlines()
+        # 1. Lecture brute et détection du header
+        raw_data = file_user.read().decode('utf-8').splitlines()
         header_index = 0
-        for i, line in enumerate(content):
-            if any(key in line for key in ["Distance", "Speed", "RPM", "Temp"]):
+        for i, line in enumerate(raw_data):
+            if any(k in line for k in ["Distance", "Speed", "RPM", "GPS"]):
                 header_index = i
                 break
         
-        from io import StringIO
-        data_str = "\n".join(content[header_index:])
-        df = pd.read_csv(StringIO(data_str), sep=None, engine='python', on_bad_lines='skip')
-        
-        # Nettoyage des noms de colonnes
+        # 2. Chargement Pandas
+        df = pd.read_csv(StringIO("\n".join(raw_data[header_index:])), sep=None, engine='python', on_bad_lines='skip')
         df.columns = [c.strip().replace('"', '') for c in df.columns]
 
-        # --- MAPPEUR INTELLIGENT ---
-        # On définit les variantes possibles pour chaque capteur
+        # 3. Mappeur de colonnes (pour éviter les KeyError)
         mapping = {
             'Vitesse': ['GPS_Speed', 'Speed', 'GPS Speed', 'VehicleSpeed', 'Vitesse'],
-            'RPM': ['RPM', 'EngineSpeed', 'Eng_RPM', 'Moteur_RPM'],
-            'Eau': ['Water_Temp', 'WaterTemp', 'ECT', 'Temp_Eau', 'Temp_H2O'],
-            'EGT': ['EGT', 'Exhaust_Temp', 'Temp_Echap'],
+            'RPM': ['RPM', 'EngineSpeed', 'Eng_RPM', 'Moteur_RPM', 'RPM_Moteur'],
+            'Eau': ['Water_Temp', 'WaterTemp', 'ECT', 'Temp_Eau', 'Temp_H2O', 'Water'],
+            'EGT': ['EGT', 'Exhaust_Temp', 'Temp_Echap', 'EGT_1'],
             'LatG': ['GPS_LatAcc', 'LatAcc', 'G_Lat', 'Acc_Lat'],
             'LonG': ['GPS_LonAcc', 'LonAcc', 'G_Lon', 'Acc_Lon'],
-            'Distance': ['Distance', 'Dist', 'GPS_Distance']
+            'Distance': ['Distance', 'Dist', 'GPS_Distance'],
+            'Lap': ['Lap', 'LapNumber', 'Tour', 'Lap_Number']
         }
 
-        # Fonction pour trouver la bonne colonne dans le CSV
-        def find_col(possible_names):
-            for name in possible_names:
-                if name in df.columns:
-                    return name
-            return None
-
-        # On renomme les colonnes trouvées vers nos noms standards
         found_cols = {}
-        for key, aliases in mapping.items():
-            col_name = find_col(aliases)
-            if col_name:
-                df = df.rename(columns={col_name: key})
-                found_cols[key] = True
+        for target, aliases in mapping.items():
+            for alias in aliases:
+                if alias in df.columns:
+                    df = df.rename(columns={alias: target})
+                    found_cols[target] = True
+                    break
 
-        # Vérification critique
-        if 'Vitesse' not in found_cols or 'RPM' not in found_cols:
-            st.error(f"❌ Colonnes critiques manquantes. Colonnes détectées : {list(df.columns)}")
-            st.info("Vérifiez que vous avez bien coché 'Speed' et 'RPM' lors de l'export RaceStudio.")
+        # Vérification des colonnes vitales
+        if 'Vitesse' not in df.columns or 'RPM' not in df.columns:
+            st.error(f"❌ Colonnes critiques introuvables. Trouvées : {list(df.columns)}")
             st.stop()
 
-        # Conversion numérique
+        # Nettoyage numérique
         for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col in mapping.keys():
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df.dropna(subset=['Vitesse', 'RPM'])
 
-        st.success("✅ Données synchronisées avec succès !")
+        # --- ANALYSE PAR TOUR ---
+        st.header("📊 Analyse de la Session")
+        
+        if 'Lap' in df.columns:
+            laps = sorted(df['Lap'].dropna().unique().astype(int))
+            # Tableau récapitulatif
+            summary = []
+            for l in laps:
+                lap_df = df[df['Lap'] == l]
+                summary.append({
+                    "Tour": l,
+                    "Vmax": lap_df['Vitesse'].max(),
+                    "RPM Max": lap_df['RPM'].max(),
+                    "Temp Eau Max": lap_df['Eau'].max() if 'Eau' in df.columns else 0
+                })
+            st.table(pd.DataFrame(summary))
+            
+            sel_lap = st.select_slider("Zoomer sur un tour", options=laps)
+            df_view = df[df['Lap'] == sel_lap]
+        else:
+            df_view = df
+            st.info("Note: Aucune colonne 'Lap' détectée, affichage du roulage continu.")
 
-        # --- UTILISEZ MAINTENANT LES NOMS SIMPLES DANS LE RESTE DU CODE ---
-        max_speed = df['Vitesse'].max()
-        max_rpm = df['RPM'].max()
-        # ... la suite de votre code avec df['Vitesse'], df['RPM'], df['Eau'], etc.
+        # --- METRICS & GRAPHS ---
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Vmax (Session)", f"{df['Vitesse'].max():.1f} km/h")
+        m2.metric("RPM Max (Session)", f"{df['RPM'].max():.0f}")
+        if 'Eau' in df.columns: m3.metric("Temp Eau Max", f"{df['Eau'].max():.1f} °C")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_view['Distance'] if 'Distance' in df_view.columns else df_view.index, 
+                                 y=df_view['Vitesse'], name="Vitesse", line=dict(color='cyan')))
+        fig.add_trace(go.Scatter(x=df_view['Distance'] if 'Distance' in df_view.columns else df_view.index, 
+                                 y=df_view['RPM'], name="RPM", yaxis="y2", line=dict(color='orange', dash='dot')))
+        fig.update_layout(yaxis2=dict(overlaying='y', side='right'), hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # --- VERDICT IA ---
+        st.subheader("🤖 Verdict de l'Ingénieur")
+        conseils = []
+        max_rpm_session = df['RPM'].max()
+        
+        if category == "Rotax 125 Junior (J125)":
+            if max_rpm_session > 13800: conseils.append("⚠️ Rapport trop COURT : tu satures trop tôt.")
+            elif max_rpm_session < 13200: conseils.append("⚠️ Rapport trop LONG : tu n'atteins pas la puissance max.")
+        
+        if 'Eau' in df.columns and df['Eau'].max() > 60:
+            conseils.append("🔥 Moteur trop chaud : Vérifie le radiateur.")
+
+        for c in conseils:
+            st.warning(c)
 
     except Exception as e:
-        st.error(f"❌ Erreur d'analyse : {e}")
+        st.error(f"❌ Erreur critique : {e}")
+
+else:
+    st.info("En attente d'un fichier CSV...")
     
     # Calcul des métriques
     max_speed = df['GPS_Speed'].max()
