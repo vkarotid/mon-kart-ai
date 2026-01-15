@@ -77,47 +77,68 @@ file_user = st.file_uploader("📂 Téléverser le fichier CSV de RaceStudio", t
 
 if file_user:
     try:
-        # 1. Lire tout le fichier en mémoire
+        # 1. Lecture du fichier
         content = file_user.read().decode('utf-8').splitlines()
-        
-        # 2. Trouver la ligne des titres (Headers)
         header_index = 0
         for i, line in enumerate(content):
-            # On cherche la ligne qui contient les données principales
-            if "Distance" in line or "GPS_Speed" in line or "RPM" in line:
+            if any(key in line for key in ["Distance", "Speed", "RPM", "Temp"]):
                 header_index = i
                 break
         
-        # 3. Charger les données en ignorant les lignes malformées (on_bad_lines)
-        # On utilise io.StringIO pour que pandas lise la liste de lignes comme un fichier
         from io import StringIO
         data_str = "\n".join(content[header_index:])
+        df = pd.read_csv(StringIO(data_str), sep=None, engine='python', on_bad_lines='skip')
         
-        df = pd.read_csv(
-            StringIO(data_str), 
-            sep=None, 
-            engine='python', 
-            on_bad_lines='skip' # C'est CA qui règle votre erreur !
-        )
-        
-        # 4. Nettoyage automatique des colonnes
+        # Nettoyage des noms de colonnes
         df.columns = [c.strip().replace('"', '') for c in df.columns]
-        
-        # 5. Conversion forcée en numérique (si AiM met du texte par erreur)
-        cols_to_fix = ['GPS_Speed', 'RPM', 'Distance', 'GPS_LatAcc', 'GPS_LonAcc']
-        for col in cols_to_fix:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # On supprime les lignes vides créées par la conversion
-        df = df.dropna(subset=['GPS_Speed', 'RPM'])
 
-        st.success(f"✅ Analyse réussie : {len(df)} points de mesure importés.")
+        # --- MAPPEUR INTELLIGENT ---
+        # On définit les variantes possibles pour chaque capteur
+        mapping = {
+            'Vitesse': ['GPS_Speed', 'Speed', 'GPS Speed', 'VehicleSpeed', 'Vitesse'],
+            'RPM': ['RPM', 'EngineSpeed', 'Eng_RPM', 'Moteur_RPM'],
+            'Eau': ['Water_Temp', 'WaterTemp', 'ECT', 'Temp_Eau', 'Temp_H2O'],
+            'EGT': ['EGT', 'Exhaust_Temp', 'Temp_Echap'],
+            'LatG': ['GPS_LatAcc', 'LatAcc', 'G_Lat', 'Acc_Lat'],
+            'LonG': ['GPS_LonAcc', 'LonAcc', 'G_Lon', 'Acc_Lon'],
+            'Distance': ['Distance', 'Dist', 'GPS_Distance']
+        }
+
+        # Fonction pour trouver la bonne colonne dans le CSV
+        def find_col(possible_names):
+            for name in possible_names:
+                if name in df.columns:
+                    return name
+            return None
+
+        # On renomme les colonnes trouvées vers nos noms standards
+        found_cols = {}
+        for key, aliases in mapping.items():
+            col_name = find_col(aliases)
+            if col_name:
+                df = df.rename(columns={col_name: key})
+                found_cols[key] = True
+
+        # Vérification critique
+        if 'Vitesse' not in found_cols or 'RPM' not in found_cols:
+            st.error(f"❌ Colonnes critiques manquantes. Colonnes détectées : {list(df.columns)}")
+            st.info("Vérifiez que vous avez bien coché 'Speed' et 'RPM' lors de l'export RaceStudio.")
+            st.stop()
+
+        # Conversion numérique
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['Vitesse', 'RPM'])
+
+        st.success("✅ Données synchronisées avec succès !")
+
+        # --- UTILISEZ MAINTENANT LES NOMS SIMPLES DANS LE RESTE DU CODE ---
+        max_speed = df['Vitesse'].max()
+        max_rpm = df['RPM'].max()
+        # ... la suite de votre code avec df['Vitesse'], df['RPM'], df['Eau'], etc.
 
     except Exception as e:
-        st.error(f"❌ Erreur de format AiM : {e}")
-        st.info("Conseil : Dans RaceStudio, assurez-vous d'exporter en 'CSV' et non en 'TXT'.")
-        st.stop()
+        st.error(f"❌ Erreur d'analyse : {e}")
     
     # Calcul des métriques
     max_speed = df['GPS_Speed'].max()
