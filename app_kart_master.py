@@ -90,4 +90,27 @@ if file_user:
                 df['Lap'] = 1
 
         # --- COMPARAISON ---
-        laps = sorted(df['Lap'].dropna().unique().astype
+        laps = sorted(df['Lap'].dropna().unique().astype(int))
+        if len(laps) > 1:
+            st.header("⚔️ Comparaison de Tours")
+            c1, c2 = st.columns(2)
+            tour_a = c1.selectbox("Tour de Référence (A)", laps, index=min(1, len(laps)-1))
+            tour_b = c2.selectbox("Tour à Comparer (B)", laps, index=len(laps)-1)
+
+            df_a = df[df['Lap'] == tour_a].copy()
+            df_b = df[df['Lap'] == tour_b].copy()
+            df_a['D_Norm'] = df_a['Distance'] - df_a['Distance'].min() if 'Distance' in df_a.columns else df_a.index
+            df_b['D_Norm'] = df_b['Distance'] - df_b['Distance'].min() if 'Distance' in df_b.columns else df_b.index
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_a['D_Norm'], y=df_a['Vitesse'], name=f"Tour {tour_a}", line=dict(color='#00CCFF', width=3)))
+            fig.add_trace(go.Scatter(x=df_b['D_Norm'], y=df_b['Vitesse'], name=f"Tour {tour_b}", line=dict(color='#FF3300', width=3, dash='dash')))
+            fig.update_layout(template="plotly_dark", hovermode="x unified", xaxis_title="Distance (m)", yaxis_title="Vitesse (km/h)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            m1, m2 = st.columns(2)
+            m1.metric(f"Vmax Tour {tour_b}", f"{df_b['Vitesse'].max():.1f} km/h", f"{df_b['Vitesse'].max() - df_a['Vitesse'].max():.1f}")
+            m2.metric(f"RPM Max Tour {tour_b}", f"{int(df_b['RPM'].max())}", f"{int(df_b['RPM'].max() - df_a['RPM'].max())}")
+
+    except Exception as e:
+        st.error(f"❌ Erreur critique : {e}")
