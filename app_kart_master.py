@@ -76,7 +76,31 @@ with st.expander("📖 GUIDE D'UTILISATION (Cliquez pour ouvrir)", expanded=Fals
 file_user = st.file_uploader("📂 Téléverser le fichier CSV de RaceStudio", type=["csv"])
 
 if file_user:
-    df = pd.read_csv(file_user, sep=None, engine='python')
+    # --- NETTOYAGE DU FICHIER AIM ---
+    # On lit le fichier ligne par ligne pour trouver l'en-tête réel
+    lines = file_user.readlines()
+    header_row = 0
+    for i, line in enumerate(lines):
+        decoded_line = line.decode('utf-8')
+        # On cherche la ligne qui contient les mots clés de télémétrie
+        if "Distance" in decoded_line or "GPS_Speed" in decoded_line:
+            header_row = i
+            break
+    
+    # On remet le pointeur au début du fichier pour pandas
+    file_user.seek(0)
+    
+    # On lit le CSV en sautant les lignes inutiles trouvées
+    try:
+        df = pd.read_csv(file_user, sep=None, engine='python', skiprows=header_row)
+        
+        # Nettoyage des noms de colonnes (parfois AiM ajoute des espaces)
+        df.columns = [c.strip() for c in df.columns]
+        
+        st.success(f"Fichier chargé ! {len(df)} points de données détectés.")
+    except Exception as e:
+        st.error(f"Erreur lors de la lecture du CSV : {e}")
+        st.stop()
     
     # Calcul des métriques
     max_speed = df['GPS_Speed'].max()
