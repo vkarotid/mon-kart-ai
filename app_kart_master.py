@@ -76,30 +76,47 @@ with st.expander("📖 GUIDE D'UTILISATION (Cliquez pour ouvrir)", expanded=Fals
 file_user = st.file_uploader("📂 Téléverser le fichier CSV de RaceStudio", type=["csv"])
 
 if file_user:
-    # --- NETTOYAGE DU FICHIER AIM ---
-    # On lit le fichier ligne par ligne pour trouver l'en-tête réel
-    lines = file_user.readlines()
-    header_row = 0
-    for i, line in enumerate(lines):
-        decoded_line = line.decode('utf-8')
-        # On cherche la ligne qui contient les mots clés de télémétrie
-        if "Distance" in decoded_line or "GPS_Speed" in decoded_line:
-            header_row = i
-            break
-    
-    # On remet le pointeur au début du fichier pour pandas
-    file_user.seek(0)
-    
-    # On lit le CSV en sautant les lignes inutiles trouvées
     try:
-        df = pd.read_csv(file_user, sep=None, engine='python', skiprows=header_row)
+        # 1. Lire tout le fichier en mémoire
+        content = file_user.read().decode('utf-8').splitlines()
         
-        # Nettoyage des noms de colonnes (parfois AiM ajoute des espaces)
-        df.columns = [c.strip() for c in df.columns]
+        # 2. Trouver la ligne des titres (Headers)
+        header_index = 0
+        for i, line in enumerate(content):
+            # On cherche la ligne qui contient les données principales
+            if "Distance" in line or "GPS_Speed" in line or "RPM" in line:
+                header_index = i
+                break
         
-        st.success(f"Fichier chargé ! {len(df)} points de données détectés.")
+        # 3. Charger les données en ignorant les lignes malformées (on_bad_lines)
+        # On utilise io.StringIO pour que pandas lise la liste de lignes comme un fichier
+        from io import StringIO
+        data_str = "\n".join(content[header_index:])
+        
+        df = pd.read_csv(
+            StringIO(data_str), 
+            sep=None, 
+            engine='python', 
+            on_bad_lines='skip' # C'est CA qui règle votre erreur !
+        )
+        
+        # 4. Nettoyage automatique des colonnes
+        df.columns = [c.strip().replace('"', '') for c in df.columns]
+        
+        # 5. Conversion forcée en numérique (si AiM met du texte par erreur)
+        cols_to_fix = ['GPS_Speed', 'RPM', 'Distance', 'GPS_LatAcc', 'GPS_LonAcc']
+        for col in cols_to_fix:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # On supprime les lignes vides créées par la conversion
+        df = df.dropna(subset=['GPS_Speed', 'RPM'])
+
+        st.success(f"✅ Analyse réussie : {len(df)} points de mesure importés.")
+
     except Exception as e:
-        st.error(f"Erreur lors de la lecture du CSV : {e}")
+        st.error(f"❌ Erreur de format AiM : {e}")
+        st.info("Conseil : Dans RaceStudio, assurez-vous d'exporter en 'CSV' et non en 'TXT'.")
         st.stop()
     
     # Calcul des métriques
